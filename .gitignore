@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets
+.env
+*.pem
+*.key
+
+# Model data / caches
+checkpoints/
+models/checkpoints/
+.cache/
+huggingface/
+
+# Generated media
+outputs/
+*.mp4
+*.mov
+*.avi
+*.webm
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
