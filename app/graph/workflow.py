@@ -16,6 +16,15 @@ def build_video_graph(provider: VideoProvider):
             "error": None,
         }
 
+    async def mark_generating(state: VideoState) -> dict:
+        # Publish the state BEFORE entering the expensive provider call. This
+        # fixes the old behavior where a real GPU job looked "preparing" for
+        # the entire inference duration.
+        return {
+            "status": "generating",
+            "progress": 0.20,
+        }
+
     async def generate(state: VideoState) -> dict:
         request = VideoGenerationRequest.model_validate(state["request"])
         result = await provider.generate(request, state["job_id"])
@@ -34,11 +43,13 @@ def build_video_graph(provider: VideoProvider):
 
     builder = StateGraph(VideoState)
     builder.add_node("prepare", prepare)
+    builder.add_node("mark_generating", mark_generating)
     builder.add_node("generate", generate)
     builder.add_node("finalize", finalize)
 
     builder.add_edge(START, "prepare")
-    builder.add_edge("prepare", "generate")
+    builder.add_edge("prepare", "mark_generating")
+    builder.add_edge("mark_generating", "generate")
     builder.add_edge("generate", "finalize")
     builder.add_edge("finalize", END)
 

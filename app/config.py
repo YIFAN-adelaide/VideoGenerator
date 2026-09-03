@@ -24,6 +24,34 @@ class Settings:
         os.getenv("MAX_CONCURRENT_GENERATIONS", "1")
     )
 
+    # External FastVideo serving runtime. The default model is our next
+    # benchmark target; the same provider can later point at HunyuanVideo 1.5.
+    fastvideo_base_url: str = os.getenv(
+        "FASTVIDEO_BASE_URL", "http://127.0.0.1:9200"
+    )
+    fastvideo_model: str = os.getenv(
+        "FASTVIDEO_MODEL",
+        "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+    )
+    fastvideo_poll_interval_seconds: float = float(
+        os.getenv("FASTVIDEO_POLL_INTERVAL_SECONDS", "1.0")
+    )
+    fastvideo_request_timeout_seconds: float = float(
+        os.getenv("FASTVIDEO_REQUEST_TIMEOUT_SECONDS", "30.0")
+    )
+    fastvideo_job_timeout_seconds: float = float(
+        os.getenv("FASTVIDEO_JOB_TIMEOUT_SECONDS", "1800.0")
+    )
+    # FastWan2.2 TI2V-5B is validated as a 720p-class model. 1280x704 is
+    # Wan's native landscape shape. Keep both sizes configurable so the same
+    # HTTP adapter can later serve a 480p Hunyuan checkpoint.
+    fastvideo_480p_size: str = os.getenv(
+        "FASTVIDEO_480P_SIZE", "832x480"
+    )
+    fastvideo_720p_size: str = os.getenv(
+        "FASTVIDEO_720P_SIZE", "1280x704"
+    )
+
     helios_repo_path: str | None = os.getenv("HELIOS_REPO_PATH")
     helios_base_model_path: str = os.getenv(
         "HELIOS_BASE_MODEL_PATH", "BestWishYsh/Helios-Distilled"

@@ -51,8 +51,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if loader is not None:
-            await asyncio.to_thread(loader.unload)
+        try:
+            await provider.close()
+        finally:
+            if loader is not None:
+                await asyncio.to_thread(loader.unload)
 
 
 app = FastAPI(
@@ -71,6 +74,12 @@ async def health() -> dict:
 
     if resources.helios_loader is not None:
         response["runtime"] = resources.helios_loader.health()
+    else:
+        runtime_health = await provider.health()
+        if runtime_health is not None:
+            response["runtime"] = runtime_health
+            if runtime_health.get("status") != "ok":
+                response["status"] = "degraded"
 
     return response
 

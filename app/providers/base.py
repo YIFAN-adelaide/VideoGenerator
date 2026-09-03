@@ -20,3 +20,11 @@ class VideoProvider(ABC):
     ) -> ProviderResult:
         """Generate one video and return its output path and metadata."""
         raise NotImplementedError
+
+    async def health(self) -> dict[str, Any] | None:
+        """Optional runtime health information for externally served providers."""
+        return None
+
+    async def close(self) -> None:
+        """Release provider-owned lightweight resources such as HTTP clients."""
+        return None
