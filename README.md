@@ -1,57 +1,98 @@
-# FastWan duration fix v1
+# Frame Extractor v1
 
-This patch fixes the current *undershoot* problem for FastWan2.2 TI2V 5B.
-
-Observed before:
-- request: 5.0 seconds @ 24 FPS
-- output: 117 frames
-- actual: 4.875 seconds
-
-New provider behavior:
-- semantic target: 5.0 seconds
-- requested frames: 120
-- provider aligns upward to the next `4n + 1` frame count
-- FastVideo payload sends `num_frames=121` explicitly
-- expected raw generated duration: about 5.0417 seconds
-
-Why upward?
-A later editing stage can drop/trim excess frames. It cannot recover a
-shortfall without duplicating/interpolating frames.
+Adds exact frame extraction for continuity/reference workflows.
 
 ## Files
 
-Add:
-- `app/providers/fastvideo_duration.py`
+- `app/services/frame_extractor.py`
+- `tests/test_frame_extractor.py`
 
-Replace/update:
-- `app/providers/fastvideo.py`
+## Design
 
-Add tests:
-- `tests/test_fastvideo_duration.py`
-- `tests/test_fastvideo_duration_payload.py`
+`FrameExtractor.extract_last_frame()`:
 
-## Run locally
+1. probes the source MP4 with `VideoProbe`
+2. reads the real decoded frame count
+3. calculates `last_index = frame_count - 1`
+4. asks ffmpeg to select that exact frame
+5. writes a lossless PNG reference image
+
+For the current FastWan output:
+
+```text
+frame_count = 121
+last_index  = 120
+```
+
+The ffmpeg filter is therefore:
+
+```text
+select=eq(n\,120)
+```
+
+This deliberately avoids approximate `-sseof` timestamp seeking.
+
+## Local test
 
 ```bash
-pytest -q tests/test_fastvideo_duration.py
-pytest -q tests/test_fastvideo_duration_payload.py
+pytest -q tests/test_frame_extractor.py
 pytest -q
 ```
 
-## Important
+## AWS real-file test
 
-This is phase 1: prevent undershoot.
+After pushing/pulling, use an existing generated shot:
 
-Do NOT add trimming yet. First push this to AWS and run one real smoke test.
-The expected real shot metadata should become approximately:
+```bash
+python - <<'PY'
+import asyncio
+from pathlib import Path
 
-```text
-requested_duration_seconds: 5.0
-actual_duration_seconds:     5.041667
-frame_count:                 121
-fps:                         24
+from app.services.frame_extractor import FrameExtractor
+
+VIDEO = Path(
+    "outputs/long-smoke-50df359b/"
+    "shots/shot_001.mp4"
+)
+
+OUTPUT = Path(
+    "outputs/long-smoke-50df359b/"
+    "references/shot_001_last.png"
+)
+
+async def main():
+    result = await FrameExtractor().extract_last_frame(
+        VIDEO,
+        OUTPUT,
+    )
+
+    print("source:", result.source_path)
+    print("output:", result.output_path)
+    print("frame_index:", result.frame_index)
+    print("source_frame_count:", result.source_frame_count)
+    print("fps:", result.source_fps)
+    print("duration:", result.source_duration_seconds)
+
+asyncio.run(main())
+PY
 ```
 
-Once that is confirmed, phase 2 is an exact-duration trim node/service that
-removes the one excess frame so each 5-second production shot becomes exactly
-120 frames at 24 FPS.
+Expected:
+
+```text
+frame_index: 120
+source_frame_count: 121
+fps: 24.0
+duration: 5.041667
+```
+
+Then verify the PNG exists:
+
+```bash
+file outputs/long-smoke-50df359b/references/shot_001_last.png
+ls -lh outputs/long-smoke-50df359b/references/shot_001_last.png
+```
+
+This stage only extracts reference assets. It does not yet pass them back to
+FastWan. The next milestone is adding an optional `initial_image` to the
+shot-generation request/provider contract.
