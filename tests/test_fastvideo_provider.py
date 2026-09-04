@@ -89,7 +89,7 @@ async def test_fastvideo_provider_submits_polls_and_downloads(tmp_path):
     assert seen_payload == {
         "model": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
         "prompt": "A tiger walking through a snowy forest",
-        "seconds": 5.0,
+        "num_frames": 121,
         "fps": 24,
         "size": "1280x704",
         "seed": 123,
@@ -101,6 +101,8 @@ async def test_fastvideo_provider_submits_polls_and_downloads(tmp_path):
     assert result.metadata["upstream_job_id"] == "video-upstream-1"
     assert result.metadata["timings"] == {"inference_seconds": 12.3}
     assert result.metadata["peak_memory_mb"] == 22000
+    assert "seconds" not in seen_payload
+    assert seen_payload["num_frames"] == 121
 
     await client.aclose()
 

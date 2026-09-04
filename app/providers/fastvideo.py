@@ -8,6 +8,10 @@ from typing import Any
 import httpx
 
 from app.providers.base import ProviderResult, VideoProvider
+from app.providers.fastvideo_duration import (
+    ResolvedFastVideoDuration,
+    resolve_fastvideo_duration,
+)
 from app.schemas import VideoGenerationRequest
 
 
@@ -63,14 +67,26 @@ class FastVideoProvider(VideoProvider):
             timeout=httpx.Timeout(request_timeout_seconds),
         )
 
+    def resolve_duration(
+        self,
+        request: VideoGenerationRequest,
+    ) -> ResolvedFastVideoDuration:
+        return resolve_fastvideo_duration(
+            model=self.model,
+            duration_seconds=request.duration_seconds,
+            fps=request.fps,
+        )
+
     def build_payload(self, request: VideoGenerationRequest) -> dict[str, Any]:
         """
         Translate our stable application schema to FastVideo's OpenAI-style
         /v1/videos contract.
 
-        We intentionally leave model-specific denoising steps and guidance
-        unset. FastVideo's served-model preset should own those defaults (for
-        example the 3-step schedule of distilled FastWan checkpoints).
+        For FastWan2.2 TI2V 5B we send an explicit model-compatible
+        ``num_frames`` value instead of ``seconds``. This prevents a semantic
+        5-second request from being normalized downward to a shorter clip.
+
+        Unknown FastVideo models retain the previous seconds-based behavior.
         """
         try:
             size = self.size_by_resolution[request.resolution]
@@ -79,15 +95,28 @@ class FastVideoProvider(VideoProvider):
                 f"Unsupported resolution for FastVideo: {request.resolution!r}"
             ) from exc
 
+        duration = self.resolve_duration(request)
+
         payload: dict[str, Any] = {
             "model": self.model,
             "prompt": request.prompt,
-            "seconds": request.duration_seconds,
             "fps": request.fps,
             "size": size,
         }
+
+        if duration.uses_explicit_num_frames:
+            if duration.generation_frames is None:
+                raise RuntimeError(
+                    "Duration resolver selected num_frames mode without "
+                    "a generation frame count."
+                )
+            payload["num_frames"] = duration.generation_frames
+        else:
+            payload["seconds"] = request.duration_seconds
+
         if request.seed is not None:
             payload["seed"] = request.seed
+
         return payload
 
     async def generate(
@@ -95,6 +124,7 @@ class FastVideoProvider(VideoProvider):
         request: VideoGenerationRequest,
         job_id: str,
     ) -> ProviderResult:
+        duration = self.resolve_duration(request)
         payload = self.build_payload(request)
         submitted_at = time.perf_counter()
 
@@ -121,6 +151,14 @@ class FastVideoProvider(VideoProvider):
             "upstream_job_id": upstream_job_id,
             "upstream_status": final_job.get("status", "completed"),
             "requested_duration_seconds": request.duration_seconds,
+            "requested_frames": duration.requested_frames,
+            "generation_num_frames": duration.generation_frames,
+            "generation_duration_seconds": duration.generation_seconds,
+            "duration_request_mode": (
+                "num_frames"
+                if duration.uses_explicit_num_frames
+                else "seconds"
+            ),
             "fps": request.fps,
             "resolution": request.resolution,
             "size": payload["size"],
