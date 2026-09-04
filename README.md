@@ -1,98 +1,131 @@
-# Frame Extractor v1
+# Image Conditioning v1
 
-Adds exact frame extraction for continuity/reference workflows.
+This patch adds the first user-image / continuity-image generation path.
+
+## Design rule
+
+The user's original image is never overwritten or stretched.
+
+Instead:
+
+```text
+original image
+    ↓
+ImageProbe
+    ↓
+aspect-ratio-aware canvas resolver
+    ↓
+ImagePreprocessor (contain)
+    ↓
+model-ready PNG under reference_assets/
+    ↓
+VideoGenerationRequest
+    ↓
+FastVideoProvider
+    ↓
+FastVideo input_reference
+```
+
+The generated video canvas follows the uploaded image's width/height
+proportion rather than forcing the existing landscape 480p/720p canvas.
+
+Examples using the 720p compute profile:
+
+```text
+1024x1536  -> 768x1152   (2:3 portrait)
+1920x1080  -> 1280x720   (16:9)
+1280x704   -> 1280x704   (existing FastWan shape)
+4000x1000  -> 1280x320   (4:1 panorama)
+```
+
+All dimensions are aligned to 16 for the current FastVideo/Wan path.
 
 ## Files
 
-- `app/services/frame_extractor.py`
-- `tests/test_frame_extractor.py`
+Add:
 
-## Design
+- `app/services/image_probe.py`
+- `app/services/image_preprocessor.py`
+- `tests/test_image_probe.py`
+- `tests/test_image_preprocessor.py`
+- `tests/test_fastvideo_image_conditioning.py`
+- `scripts/smoke_image_to_video.py`
 
-`FrameExtractor.extract_last_frame()`:
+Update:
 
-1. probes the source MP4 with `VideoProbe`
-2. reads the real decoded frame count
-3. calculates `last_index = frame_count - 1`
-4. asks ffmpeg to select that exact frame
-5. writes a lossless PNG reference image
+- `app/schemas.py`
+- `app/providers/fastvideo.py`
 
-For the current FastWan output:
-
-```text
-frame_count = 121
-last_index  = 120
-```
-
-The ffmpeg filter is therefore:
-
-```text
-select=eq(n\,120)
-```
-
-This deliberately avoids approximate `-sseof` timestamp seeking.
-
-## Local test
+## Local tests
 
 ```bash
-pytest -q tests/test_frame_extractor.py
+pytest -q tests/test_image_probe.py
+pytest -q tests/test_image_preprocessor.py
+pytest -q tests/test_fastvideo_image_conditioning.py
 pytest -q
 ```
 
-## AWS real-file test
+## AWS shared input mount
 
-After pushing/pulling, use an existing generated shot:
+FastVideo runs in Docker, while VideoGenerator runs on the host. The prepared
+reference image therefore needs one shared directory.
+
+Create it:
 
 ```bash
-python - <<'PY'
-import asyncio
-from pathlib import Path
-
-from app.services.frame_extractor import FrameExtractor
-
-VIDEO = Path(
-    "outputs/long-smoke-50df359b/"
-    "shots/shot_001.mp4"
-)
-
-OUTPUT = Path(
-    "outputs/long-smoke-50df359b/"
-    "references/shot_001_last.png"
-)
-
-async def main():
-    result = await FrameExtractor().extract_last_frame(
-        VIDEO,
-        OUTPUT,
-    )
-
-    print("source:", result.source_path)
-    print("output:", result.output_path)
-    print("frame_index:", result.frame_index)
-    print("source_frame_count:", result.source_frame_count)
-    print("fps:", result.source_fps)
-    print("duration:", result.source_duration_seconds)
-
-asyncio.run(main())
-PY
+cd ~/VG/VideoGenerator
+mkdir -p reference_assets/prepared
 ```
 
-Expected:
+Restart the FastVideo container with this additional mount:
+
+```bash
+-v ~/VG/VideoGenerator/reference_assets:/inputs:ro
+```
+
+For your existing docker run command, that means adding:
+
+```bash
+-v ~/VG/VideoGenerator/reference_assets:/inputs:ro \
+```
+
+alongside the existing Hugging Face/output/config mounts.
+
+The first generation after restarting the compiled FastVideo server may need
+to compile/warm again.
+
+## Real image-to-video test
+
+You can use the final frame we already extracted as the source image:
+
+```bash
+python -m scripts.smoke_image_to_video \
+  --image outputs/long-smoke-50df359b/references/shot_001_last.png \
+  --prompt "The tiger continues walking naturally through the snowy forest." \
+  --resolution 720p \
+  --duration 5
+```
+
+The script will:
+
+1. keep the original PNG untouched,
+2. create a prepared image under `reference_assets/prepared/`,
+3. preserve its aspect ratio,
+4. pass `/inputs/prepared/...png` to FastVideo,
+5. generate a 121-frame FastWan video,
+6. probe and print the real output size.
+
+For the current extracted 1280x704 frame, the canvas should remain 1280x704.
+
+After this manual image-conditioned shot works, the next change is to connect
+`FrameExtractor` automatically:
 
 ```text
-frame_index: 120
-source_frame_count: 121
-fps: 24.0
-duration: 5.041667
+Shot N
+  ↓
+FrameExtractor
+  ↓
+reference_assets/jobs/<job>/shot_N_last.png
+  ↓
+Shot N+1 initial_image
 ```
-
-Then verify the PNG exists:
-
-```bash
-file outputs/long-smoke-50df359b/references/shot_001_last.png
-ls -lh outputs/long-smoke-50df359b/references/shot_001_last.png
-```
-
-This stage only extracts reference assets. It does not yet pass them back to
-FastWan. The next milestone is adding an optional `initial_image` to the
-shot-generation request/provider contract.
