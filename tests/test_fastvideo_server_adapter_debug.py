@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
-from textwrap import indent
 
 import pytest
+
+from tests._diagnostic_env import docker_container_running
 
 
 CONTAINER = "fastvideo-wan"
@@ -44,43 +44,13 @@ def _docker_exec_shell(command: str) -> subprocess.CompletedProcess[str]:
 
 def test_print_fastvideo_server_request_mapping() -> None:
     """
-    Diagnostic-only test.
-
-    It does NOT generate a video and does NOT use the GPU for inference.
-    It prints the relevant source code from the *actual FastVideo container*
-    so we can see where OpenAI `/v1/videos` request fields such as:
-
-        size
-        width / height
-        input_reference
-        num_frames
-
-    are translated into FastVideo sampling parameters.
-
-    Run with:
-
-        pytest -q -s tests/test_fastvideo_server_adapter_debug.py
+    AWS/runtime diagnostic. Skips cleanly on local machines without the
+    running FastVideo Docker container.
     """
-    if shutil.which("docker") is None:
-        pytest.skip("docker is not installed in this environment")
-
-    running = _run(
-        "docker",
-        "inspect",
-        "-f",
-        "{{.State.Running}}",
-        CONTAINER,
-    )
-
-    if running.returncode != 0:
-        pytest.fail(
-            f"Could not inspect Docker container {CONTAINER!r}:\n"
-            f"{running.stderr.strip()}"
-        )
-
-    if running.stdout.strip().lower() != "true":
-        pytest.fail(
-            f"Docker container {CONTAINER!r} is not running."
+    running, reason = docker_container_running(CONTAINER)
+    if not running:
+        pytest.skip(
+            f"FastVideo Docker runtime unavailable: {reason}"
         )
 
     print("\n" + "=" * 88)
@@ -114,19 +84,10 @@ def test_print_fastvideo_server_request_mapping() -> None:
         print("-" * 88)
 
         text = result.stdout.strip()
+        print(text or "(No matching lines found.)")
 
-        if text:
-            print(text)
-        else:
-            print("(No matching lines found.)")
+    assert found_any
 
-    assert found_any, (
-        "None of the expected FastVideo source files were found "
-        "inside the running container."
-    )
-
-    # Also print the exact model/server config because a fixed sampling
-    # profile in YAML may be overriding the OpenAI request size.
     print("\n" + "=" * 88)
     print("SERVER CONFIG")
     print("=" * 88)
@@ -135,21 +96,7 @@ def test_print_fastvideo_server_request_mapping() -> None:
         'cat /configs/fastwan5b_server.yaml 2>/dev/null || true'
     )
 
-    if config.stdout.strip():
-        print(config.stdout.strip())
-    else:
-        print(
-            "Could not read /configs/fastwan5b_server.yaml "
-            "from the container."
-        )
-
-    print("\n" + "=" * 88)
-    print("WHAT WE ARE LOOKING FOR")
-    print("=" * 88)
     print(
-        "1. Does request_adapter parse request.size?\n"
-        "2. Does it assign parsed values to sampling width/height?\n"
-        "3. Does input_reference become the model image input?\n"
-        "4. Does fastwan5b_server.yaml force width=832 and height=480?\n"
-        "5. Is there a model/profile default applied after request parsing?"
+        config.stdout.strip()
+        or "Could not read /configs/fastwan5b_server.yaml"
     )

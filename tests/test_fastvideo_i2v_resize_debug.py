@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
 
 import pytest
+
+from tests._diagnostic_env import docker_container_running
 
 
 CONTAINER = "fastvideo-wan"
@@ -55,40 +56,13 @@ def _print_section(title: str) -> None:
 
 def test_locate_fastvideo_i2v_resize_logic() -> None:
     """
-    Diagnostic-only test.
-
-    It does NOT generate video and does NOT run inference.
-
-    It searches the actual FastVideo container for I2V/reference-image
-    preprocessing and resize logic, especially any 480*832/max-area rule.
-
-    Run:
-
-        pytest -q -s tests/test_fastvideo_i2v_resize_debug.py
-
-    The output is intentionally limited to matching filenames and compact
-    context blocks so it is easy to paste back into ChatGPT.
+    AWS/runtime diagnostic. Skips cleanly on local machines without the
+    running FastVideo Docker container.
     """
-    if shutil.which("docker") is None:
-        pytest.skip("docker is not installed")
-
-    running = _run(
-        "docker",
-        "inspect",
-        "-f",
-        "{{.State.Running}}",
-        CONTAINER,
-    )
-
-    if running.returncode != 0:
-        pytest.fail(
-            f"Could not inspect container {CONTAINER!r}:\n"
-            f"{running.stderr.strip()}"
-        )
-
-    if running.stdout.strip().lower() != "true":
-        pytest.fail(
-            f"Container {CONTAINER!r} is not running."
+    running, reason = docker_container_running(CONTAINER)
+    if not running:
+        pytest.skip(
+            f"FastVideo Docker runtime unavailable: {reason}"
         )
 
     _print_section("FASTVIDEO I2V RESIZE DIAGNOSTIC")
@@ -99,7 +73,6 @@ def test_locate_fastvideo_i2v_resize_logic() -> None:
         for root in SEARCH_ROOTS
     )
 
-    # First locate likely files using a broad but bounded grep.
     pattern_expr = "|".join(PATTERNS)
 
     locate_cmd = (
@@ -118,16 +91,10 @@ def test_locate_fastvideo_i2v_resize_logic() -> None:
         if line.strip()
     ]
 
-    if not files:
-        print(
-            "No likely I2V resize files were found with the first search."
-        )
-
     _print_section("LIKELY SOURCE FILES")
     for file_path in files:
         print(file_path)
 
-    # Search for the most suspicious rules first.
     suspicious_patterns = [
         "480[[:space:]]*\\*[[:space:]]*832",
         "832[[:space:]]*\\*[[:space:]]*480",
@@ -150,53 +117,4 @@ def test_locate_fastvideo_i2v_resize_logic() -> None:
             )
             print(result.stdout.strip())
 
-    # Then inspect compact context around image conditioning / resizing.
-    compact_pattern = (
-        "input_reference|reference_image|"
-        "resize|image_size|height|width"
-    )
-
-    for file_path in files[:12]:
-        result = _docker_shell(
-            "grep -n -C 8 -E "
-            f"'{compact_pattern}' "
-            f'"{file_path}" 2>/dev/null | head -n 140'
-        )
-
-        if result.stdout.strip():
-            _print_section(
-                f"CONTEXT: {file_path}"
-            )
-            print(result.stdout.strip())
-
-    # Show relevant package versions because behavior can differ by release.
-    _print_section("INSTALLED FASTVIDEO VERSION")
-    version_result = _docker_shell(
-        "/opt/venv/bin/python - <<'PY'\n"
-        "try:\n"
-        "    import importlib.metadata as m\n"
-        "    print('fastvideo:', m.version('fastvideo'))\n"
-        "except Exception as exc:\n"
-        "    print('fastvideo version unavailable:', exc)\n"
-        "try:\n"
-        "    import diffusers\n"
-        "    print('diffusers:', diffusers.__version__)\n"
-        "except Exception as exc:\n"
-        "    print('diffusers version unavailable:', exc)\n"
-        "PY"
-    )
-    print(version_result.stdout.strip())
-
-    _print_section("INTERPRETATION GUIDE")
-    print(
-        "What matters most:\n"
-        "1. Any code that computes a max area around 480*832.\n"
-        "2. Any code that resizes input_reference before sampling.\n"
-        "3. Any code that replaces request width/height after request_adapter.\n"
-        "4. Whether the resize preserves aspect ratio or forces 832x480.\n"
-        "5. Whether the TI2V pipeline has its own default dimensions.\n"
-    )
-
-    assert files or found_suspicious, (
-        "The diagnostic could not find any likely image/I2V source files."
-    )
+    assert files or found_suspicious

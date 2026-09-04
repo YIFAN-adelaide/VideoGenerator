@@ -19,13 +19,16 @@ def _find_reference_image() -> Path:
     """
     Use DEBUG_INITIAL_IMAGE when supplied; otherwise use the newest prepared
     reference image created by scripts/smoke_image_to_video.py.
+
+    This is an environment diagnostic, so lack of an AWS/prepared asset causes
+    a pytest skip rather than a local-suite failure.
     """
     explicit = os.getenv("DEBUG_INITIAL_IMAGE")
 
     if explicit:
         path = Path(explicit).expanduser().resolve()
         if not path.exists():
-            pytest.fail(
+            pytest.skip(
                 f"DEBUG_INITIAL_IMAGE does not exist: {path}"
             )
         return path
@@ -33,13 +36,16 @@ def _find_reference_image() -> Path:
     prepared_dir = Path("reference_assets/prepared").resolve()
 
     if not prepared_dir.exists():
-        pytest.fail(
-            f"Prepared reference directory does not exist: {prepared_dir}"
+        pytest.skip(
+            "No prepared reference_assets directory in this environment. "
+            "Run this diagnostic on AWS after an image-to-video preparation "
+            "step, or set DEBUG_INITIAL_IMAGE."
         )
 
     candidates = sorted(
         (
-            p for p in prepared_dir.glob("*.png")
+            p
+            for p in prepared_dir.glob("*.png")
             if p.is_file()
         ),
         key=lambda p: p.stat().st_mtime,
@@ -47,7 +53,7 @@ def _find_reference_image() -> Path:
     )
 
     if not candidates:
-        pytest.fail(
+        pytest.skip(
             f"No prepared PNG images found in {prepared_dir}"
         )
 
@@ -60,14 +66,20 @@ async def test_print_real_fastvideo_payload() -> None:
     Diagnostic-only test.
 
     It DOES NOT call FastVideo and DOES NOT use the GPU.
-    It only shows exactly what VideoGenerator's FastVideoProvider would send
-    to POST /v1/videos for the newest prepared reference image.
+    It prints exactly what FastVideoProvider would send to /v1/videos.
     """
+    image_path = _find_reference_image()
+
     settings = Settings()
     resources = build_provider_resources(settings)
     provider = resources.provider
 
-    image_path = _find_reference_image()
+    if not hasattr(provider, "build_payload"):
+        pytest.skip(
+            "Current environment is not configured with FastVideoProvider. "
+            "Load the FastVideo .env or run this diagnostic on AWS."
+        )
+
     image_info = await ImageProbe().probe(image_path)
 
     request = VideoGenerationRequest(
@@ -101,22 +113,12 @@ async def test_print_real_fastvideo_payload() -> None:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         print("=" * 72)
 
-        assert payload.get("input_reference"), (
-            "input_reference is missing from the FastVideo payload"
-        )
+        assert payload.get("input_reference")
 
-        expected_size = (
-            f"{image_info.width}x{image_info.height}"
-        )
-        assert payload.get("size") == expected_size, (
-            "FastVideo payload size does not match the prepared "
-            f"reference image. Expected {expected_size}, "
-            f"got {payload.get('size')!r}"
-        )
+        expected_size = f"{image_info.width}x{image_info.height}"
+        assert payload.get("size") == expected_size
 
-        assert payload.get("num_frames") == 121, (
-            "Expected the FastWan 5-second request to use 121 frames"
-        )
+        assert payload.get("num_frames") == 121
 
     finally:
         close = getattr(provider, "close", None)
