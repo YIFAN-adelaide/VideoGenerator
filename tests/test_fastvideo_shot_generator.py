@@ -11,6 +11,8 @@ from app.services.fastvideo_shot_generator import (
     FastVideoShotGenerator,
     FastVideoShotGeneratorError,
 )
+from app.services.generated_shot import GeneratedShot
+from app.services.video_probe import VideoProbeResult
 
 
 class FakeVideoProvider:
@@ -45,6 +47,40 @@ class FakeVideoProvider:
             metadata={
                 "provider": "fastvideo",
             },
+        )
+
+
+class FakeVideoProbe:
+    def __init__(
+        self,
+        *,
+        duration_seconds: float = 4.875,
+        fps: float = 24.0,
+        frame_count: int = 117,
+        width: int = 1280,
+        height: int = 704,
+    ) -> None:
+        self.duration_seconds = duration_seconds
+        self.fps = fps
+        self.frame_count = frame_count
+        self.width = width
+        self.height = height
+        self.paths: list[Path] = []
+
+    async def probe(
+        self,
+        path: str | Path,
+    ) -> VideoProbeResult:
+        resolved = Path(path).resolve()
+        self.paths.append(resolved)
+
+        return VideoProbeResult(
+            path=resolved,
+            duration_seconds=self.duration_seconds,
+            fps=self.fps,
+            frame_count=self.frame_count,
+            width=self.width,
+            height=self.height,
         )
 
 
@@ -93,9 +129,11 @@ def test_adapter_maps_shot_to_video_generation_request(
     provider = FakeVideoProvider(
         provider_output
     )
+    probe = FakeVideoProbe()
 
     adapter = FastVideoShotGenerator(
-        provider
+        provider,
+        video_probe=probe,
     )
 
     target = (
@@ -115,8 +153,25 @@ def test_adapter_maps_shot_to_video_generation_request(
         )
     )
 
-    assert result == target.resolve()
+    assert isinstance(result, GeneratedShot)
+    assert result.path == target.resolve()
     assert target.exists()
+
+    assert result.requested_duration_seconds == 5.0
+    assert result.actual_duration_seconds == pytest.approx(
+        4.875
+    )
+    assert result.duration_delta_seconds == pytest.approx(
+        -0.125
+    )
+    assert result.fps == pytest.approx(24.0)
+    assert result.frame_count == 117
+    assert result.width == 1280
+    assert result.height == 704
+
+    assert probe.paths == [
+        target.resolve()
+    ]
 
     assert len(provider.requests) == 1
 
@@ -144,7 +199,8 @@ def test_adapter_passes_seed_from_shot_metadata(
     )
 
     adapter = FastVideoShotGenerator(
-        provider
+        provider,
+        video_probe=FakeVideoProbe(),
     )
 
     target = (
@@ -185,6 +241,7 @@ def test_adapter_can_move_instead_of_copy(
     adapter = FastVideoShotGenerator(
         provider,
         preserve_provider_output=False,
+        video_probe=FakeVideoProbe(),
     )
 
     target = (
@@ -202,7 +259,7 @@ def test_adapter_can_move_instead_of_copy(
         )
     )
 
-    assert result.exists()
+    assert result.path.exists()
     assert not provider_output.exists()
 
 
@@ -215,7 +272,8 @@ def test_adapter_rejects_empty_prompt(
     )
 
     adapter = FastVideoShotGenerator(
-        provider
+        provider,
+        video_probe=FakeVideoProbe(),
     )
 
     with pytest.raises(
@@ -254,7 +312,8 @@ def test_adapter_rejects_missing_provider_output(
             )
 
     adapter = FastVideoShotGenerator(
-        MissingOutputProvider()
+        MissingOutputProvider(),
+        video_probe=FakeVideoProbe(),
     )
 
     with pytest.raises(
@@ -284,7 +343,8 @@ def test_adapter_rejects_invalid_seed(
     )
 
     adapter = FastVideoShotGenerator(
-        provider
+        provider,
+        video_probe=FakeVideoProbe(),
     )
 
     with pytest.raises(
@@ -298,6 +358,41 @@ def test_adapter_rejects_invalid_seed(
                         "seed": "abc",
                     },
                 ),
+                prompt="Tiger scene",
+                output_path=(
+                    tmp_path
+                    / "job"
+                    / "shots"
+                    / "shot_001.mp4"
+                ),
+            )
+        )
+
+
+def test_adapter_wraps_probe_failure(
+    tmp_path: Path,
+):
+    class FailingProbe:
+        async def probe(self, path):
+            raise RuntimeError("probe failed")
+
+    provider = FakeVideoProvider(
+        tmp_path
+        / "provider.mp4"
+    )
+
+    adapter = FastVideoShotGenerator(
+        provider,
+        video_probe=FailingProbe(),
+    )
+
+    with pytest.raises(
+        FastVideoShotGeneratorError,
+        match="Could not inspect generated shot",
+    ):
+        asyncio.run(
+            adapter.generate_shot(
+                shot=_shot(),
                 prompt="Tiger scene",
                 output_path=(
                     tmp_path

@@ -4,9 +4,12 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from app.director.mock_director import MockDirector
 from app.director.video_plan import DirectorRequest, ShotPlan
 from app.graph.long_video_workflow import LongVideoWorkflow
+from app.services.generated_shot import GeneratedShot
 
 
 class FakeShotGenerator:
@@ -34,6 +37,33 @@ class FakeShotGenerator:
         )
 
         return output_path
+
+
+class MetadataShotGenerator(FakeShotGenerator):
+    async def generate_shot(
+        self,
+        *,
+        shot: ShotPlan,
+        prompt: str,
+        output_path: Path,
+    ) -> GeneratedShot:
+        path = await super().generate_shot(
+            shot=shot,
+            prompt=prompt,
+            output_path=output_path,
+        )
+
+        return GeneratedShot(
+            path=path.resolve(),
+            requested_duration_seconds=float(
+                shot.duration_seconds
+            ),
+            actual_duration_seconds=4.875,
+            fps=24.0,
+            frame_count=117,
+            width=1280,
+            height=704,
+        )
 
 
 @dataclass
@@ -117,6 +147,16 @@ def test_long_video_workflow_generates_three_shots_and_composes(
     ) == 3
 
     assert len(
+        result["completed_shots"]
+    ) == 3
+
+    # Legacy Path-returning generators remain supported.
+    assert all(
+        item["actual_duration_seconds"] is None
+        for item in result["completed_shots"]
+    )
+
+    assert len(
         composer.received_inputs
     ) == 3
 
@@ -126,6 +166,55 @@ def test_long_video_workflow_generates_three_shots_and_composes(
 
     assert final_path.exists()
     assert final_path.name == "final.mp4"
+
+
+def test_long_video_workflow_records_real_shot_metadata(
+    tmp_path: Path,
+):
+    workflow = LongVideoWorkflow(
+        director=MockDirector(),
+        shot_generator=MetadataShotGenerator(),
+        composer=FakeComposer(),
+        output_dir=tmp_path,
+        video_prompt_language="en",
+    )
+
+    result = asyncio.run(
+        workflow.run(
+            DirectorRequest(
+                prompt="A cinematic tiger story.",
+                target_duration_seconds=15,
+                max_shot_duration_seconds=5,
+            ),
+            job_id="job-metadata",
+        )
+    )
+
+    assert result["status"] == "completed"
+
+    completed = result["completed_shots"]
+    assert len(completed) == 3
+
+    first = completed[0]
+
+    assert first["shot_id"] == "shot_001"
+    assert first["requested_duration_seconds"] == 5.0
+    assert first["actual_duration_seconds"] == pytest.approx(
+        4.875
+    )
+    assert first["duration_delta_seconds"] == pytest.approx(
+        -0.125
+    )
+    assert first["actual_fps"] == pytest.approx(24.0)
+    assert first["frame_count"] == 117
+    assert first["width"] == 1280
+    assert first["height"] == 704
+
+    assert sum(
+        item["actual_duration_seconds"]
+        for item in completed
+        if item["actual_duration_seconds"] is not None
+    ) == pytest.approx(14.625)
 
 
 def test_long_video_workflow_handles_partial_final_shot(
@@ -239,17 +328,14 @@ def test_long_video_workflow_stops_when_shot_generation_fails(
 def test_long_video_workflow_rejects_invalid_prompt_language(
     tmp_path: Path,
 ):
-    try:
+    with pytest.raises(
+        ValueError,
+        match="must be 'en' or 'zh'",
+    ):
         LongVideoWorkflow(
             director=MockDirector(),
             shot_generator=FakeShotGenerator(),
             composer=FakeComposer(),
             output_dir=tmp_path,
             video_prompt_language="fr",
-        )
-    except ValueError as exc:
-        assert "must be 'en' or 'zh'" in str(exc)
-    else:
-        raise AssertionError(
-            "Expected ValueError for invalid language."
         )

@@ -7,6 +7,8 @@ from pathlib import Path
 from app.director.video_plan import ShotPlan
 from app.providers.base import VideoProvider
 from app.schemas import VideoGenerationRequest
+from app.services.generated_shot import GeneratedShot
+from app.services.video_probe import VideoProbe
 
 
 class FastVideoShotGeneratorError(RuntimeError):
@@ -18,7 +20,7 @@ class FastVideoShotGenerator:
     Adapter between LongVideoWorkflow's ShotGenerator protocol and the
     existing VideoProvider contract.
 
-    The existing provider API remains unchanged:
+    The provider API remains unchanged:
 
         await provider.generate(
             request: VideoGenerationRequest,
@@ -26,8 +28,9 @@ class FastVideoShotGenerator:
         )
 
     This adapter translates one ShotPlan into one VideoGenerationRequest,
-    invokes the provider, and materializes the returned MP4 at the path
-    requested by LongVideoWorkflow.
+    invokes the provider, materializes the returned MP4 at the path
+    requested by LongVideoWorkflow, and probes the final file so the
+    workflow receives its real duration/frame metadata.
     """
 
     def __init__(
@@ -35,9 +38,11 @@ class FastVideoShotGenerator:
         provider: VideoProvider,
         *,
         preserve_provider_output: bool = True,
+        video_probe: VideoProbe | None = None,
     ) -> None:
         self._provider = provider
         self._preserve_provider_output = preserve_provider_output
+        self._video_probe = video_probe or VideoProbe()
 
     async def generate_shot(
         self,
@@ -45,7 +50,7 @@ class FastVideoShotGenerator:
         shot: ShotPlan,
         prompt: str,
         output_path: Path,
-    ) -> Path:
+    ) -> GeneratedShot:
         cleaned_prompt = prompt.strip()
 
         if not cleaned_prompt:
@@ -102,32 +107,50 @@ class FastVideoShotGenerator:
                 f"{provider_output}"
             )
 
-        if provider_output == target:
-            return target
-
-        try:
-            if self._preserve_provider_output:
-                shutil.copy2(
-                    provider_output,
-                    target,
-                )
-            else:
-                shutil.move(
-                    str(provider_output),
-                    str(target),
-                )
-        except OSError as exc:
-            raise FastVideoShotGeneratorError(
-                "Could not materialize provider output at "
-                f"{target}: {exc}"
-            ) from exc
+        if provider_output != target:
+            try:
+                if self._preserve_provider_output:
+                    shutil.copy2(
+                        provider_output,
+                        target,
+                    )
+                else:
+                    shutil.move(
+                        str(provider_output),
+                        str(target),
+                    )
+            except OSError as exc:
+                raise FastVideoShotGeneratorError(
+                    "Could not materialize provider output at "
+                    f"{target}: {exc}"
+                ) from exc
 
         if not target.exists() or target.stat().st_size <= 0:
             raise FastVideoShotGeneratorError(
                 f"Shot output was not created correctly: {target}"
             )
 
-        return target
+        try:
+            probe_result = await self._video_probe.probe(target)
+        except Exception as exc:
+            raise FastVideoShotGeneratorError(
+                f"Could not inspect generated shot "
+                f"{shot.shot_id}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        return GeneratedShot(
+            path=probe_result.path,
+            requested_duration_seconds=float(
+                shot.duration_seconds
+            ),
+            actual_duration_seconds=(
+                probe_result.duration_seconds
+            ),
+            fps=probe_result.fps,
+            frame_count=probe_result.frame_count,
+            width=probe_result.width,
+            height=probe_result.height,
+        )
 
     @staticmethod
     def _extract_seed(
@@ -184,3 +207,9 @@ class FastVideoShotGenerator:
             cleaned = f"shot_{shot.shot_id}"
 
         return cleaned[:180]
+
+
+__all__ = [
+    "FastVideoShotGenerator",
+    "FastVideoShotGeneratorError",
+]

@@ -1,106 +1,83 @@
-# VideoGenerator
+# VideoProbe integration v1
 
-Phase 1 of a local-development / AWS-GPU video generation service.
+This patch integrates the already-tested `VideoProbe` into the real long-video
+generation path.
 
-## Current architecture
+## Files
 
-FastAPI -> LangGraph -> VideoProvider
+Add:
+- `app/services/generated_shot.py`
 
-Local development uses `MockVideoProvider`.
-AWS will later use `HeliosProvider`.
+Replace/update:
+- `app/services/fastvideo_shot_generator.py`
+- `app/graph/long_video_workflow.py`
+- `app/tests/test_fastvideo_shot_generator.py`
+- `app/tests/test_long_video_workflow.py`
 
-The first graph is deliberately small:
+Existing required file:
+- `app/services/video_probe.py`
 
-START -> prepare -> generate -> finalize -> END
+## What changes
 
-This proves the API and orchestration contract before Helios/CUDA/model
-dependencies are introduced.
+`FastVideoShotGenerator.generate_shot()` now returns a `GeneratedShot`
+containing the final MP4 path plus observed ffprobe metadata.
 
-## Python
+The LangGraph workflow remains backward-compatible with shot generators that
+still return `Path` or `str`.
 
-Python 3.11 is recommended.
+New state:
+- `completed_shot_paths`: preserved for `VideoComposer`
+- `completed_shots`: JSON-friendly per-shot observed metadata
 
-## Setup
+For the current FastWan 5-second request, AWS should record approximately:
+
+- requested duration: 5.0
+- actual duration: 4.875
+- delta: -0.125
+- fps: 24
+- frames: 117
+- resolution: 1280x704
+
+Three shots should therefore report about 14.625 seconds of observed generated
+material.
+
+## Test locally
 
 ```bash
-python -m venv .venv
-```
-
-Windows PowerShell:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-Install:
-
-```bash
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-## Run tests
-
-```bash
+pytest -q app/tests/test_video_probe.py
+pytest -q app/tests/test_fastvideo_shot_generator.py
+pytest -q app/tests/test_long_video_workflow.py
 pytest -q
 ```
 
-## Start locally
+## AWS smoke test
 
-PowerShell:
+After pushing and pulling:
 
-```powershell
-$env:VIDEO_PROVIDER="mock"
-uvicorn app.main:app --host 127.0.0.1 --port 9100 --reload
+```bash
+cd ~/VG/VideoGenerator
+source .venv/bin/activate
+set -a
+source .env
+set +a
+
+python -m scripts.smoke_long_video
 ```
 
-Open:
+To inspect the new metadata, temporarily add to the smoke script after
+`result = await workflow.run(...)`:
 
-- http://127.0.0.1:9100/docs
-- http://127.0.0.1:9100/health
+```python
+print("completed_shots:")
+for shot in result["completed_shots"]:
+    print(shot)
 
-## Create a mock generation job
-
-```powershell
-$body = @{
-  prompt = "A cinematic tiger walking through a forest"
-  duration_seconds = 4
-  fps = 24
-  resolution = "480p"
-} | ConvertTo-Json
-
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://127.0.0.1:9100/v1/videos" `
-  -ContentType "application/json" `
-  -Body $body
+observed = sum(
+    shot["actual_duration_seconds"] or 0.0
+    for shot in result["completed_shots"]
+)
+print("observed generated duration:", observed)
 ```
 
-Then poll:
-
-```powershell
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:9100/v1/videos/<JOB_ID>"
-```
-
-## AWS port
-
-The service will still listen on `127.0.0.1:9100` on EC2 and be reached
-through the SSH tunnel:
-
-```powershell
-ssh -i "D:\VideoGenerator\Documents\Video_Generator.pem" `
-  -L 9100:127.0.0.1:9100 `
-  ubuntu@<EC2_PUBLIC_IP>
-```
-
-Do not expose port 9100 publicly.
-
-## Next implementation phase
-
-1. Implement `HeliosProvider`.
-2. Normalize requested duration to Helios frame/chunk constraints.
-3. Add real progress/metrics around model inference.
-4. Add durable LangGraph checkpointing/job persistence.
-5. Add LangChain LLM scene planning for long videos.
-6. Add multi-scene generation + FFmpeg composition.
+Do not add an exact-duration trimming step yet. This patch is observability and
+state integration only.
