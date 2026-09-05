@@ -8,9 +8,14 @@ from langgraph.graph import END, START, StateGraph
 
 from app.director.base import BaseDirector
 from app.director.video_plan import DirectorRequest, ShotPlan, VideoPlan
+from app.services.continuity_prompt_builder import ContinuityPromptBuilder
 from app.services.frame_extractor import FrameExtractor
 from app.services.generated_shot import GeneratedShot
 from app.services.shot_continuity import ShotContinuityState
+from app.services.temporal_continuity import TemporalContinuityState
+from app.services.temporal_continuity_provider import (
+    TemporalContinuityProvider,
+)
 from app.services.video_composer import VideoComposer
 
 
@@ -42,6 +47,10 @@ class CompletedShotInfo(TypedDict):
     initial_image_path: str | None
     last_frame_reference_path: str | None
 
+    base_generation_prompt: str
+    effective_generation_prompt: str
+    temporal_continuity: dict[str, object] | None
+
 
 class LongVideoState(TypedDict):
     job_id: str
@@ -63,19 +72,19 @@ class LongVideoState(TypedDict):
 
 class LongVideoWorkflow:
     """
-    Sequential long-video workflow with optional shot-to-shot continuity.
+    Sequential long-video workflow.
 
-    Continuity is enabled when ``frame_extractor`` is provided:
+    V1 continuity:
+        previous shot final frame -> next shot initial_image
 
-        Shot N
-          -> generate
-          -> extract exact final frame
-          -> store under reference_assets/jobs/<job_id>/
-          -> pass that PNG as initial_image for Shot N+1
+    V2 continuity:
+        previous shot final frame
+        + semantic TemporalContinuityState
+        -> ContinuityPromptBuilder
+        -> next FastWan prompt
 
-    If ``frame_extractor`` is omitted, the workflow behaves like the previous
-    implementation and does not pass initial_image arguments to legacy fake
-    generators. This keeps existing tests/backends backward compatible.
+    The prompt builder is deterministic. A future vLLM Director can implement
+    TemporalContinuityProvider without changing the workflow.
     """
 
     def __init__(
@@ -88,6 +97,12 @@ class LongVideoWorkflow:
         video_prompt_language: str = "en",
         frame_extractor: FrameExtractor | None = None,
         reference_asset_dir: str | Path = "reference_assets",
+        temporal_continuity_provider: (
+            TemporalContinuityProvider | None
+        ) = None,
+        continuity_prompt_builder: (
+            ContinuityPromptBuilder | None
+        ) = None,
     ) -> None:
         if video_prompt_language not in {"en", "zh"}:
             raise ValueError(
@@ -107,11 +122,26 @@ class LongVideoWorkflow:
             .resolve()
         )
 
+        self._temporal_continuity_provider = (
+            temporal_continuity_provider
+        )
+        self._continuity_prompt_builder = (
+            continuity_prompt_builder
+            or ContinuityPromptBuilder()
+        )
+
         self.graph = self._build_graph()
 
     @property
     def continuity_enabled(self) -> bool:
         return self._frame_extractor is not None
+
+    @property
+    def temporal_continuity_enabled(self) -> bool:
+        return (
+            self._temporal_continuity_provider
+            is not None
+        )
 
     def _build_graph(self):
         builder = StateGraph(LongVideoState)
@@ -213,9 +243,9 @@ class LongVideoWorkflow:
             "error": None,
         }
 
-        result = await self.graph.ainvoke(initial_state)
-
-        return result
+        return await self.graph.ainvoke(
+            initial_state
+        )
 
     async def _plan_video(
         self,
@@ -278,7 +308,9 @@ class LongVideoWorkflow:
             }
 
         shot = plan.shots[index]
-        prompt = self._select_generation_prompt(shot)
+        base_prompt = self._select_generation_prompt(
+            shot
+        )
 
         shot_dir = (
             self._output_dir
@@ -311,19 +343,52 @@ class LongVideoWorkflow:
             else None
         )
 
+        temporal_state: (
+            TemporalContinuityState | None
+        ) = None
+
+        effective_prompt = base_prompt
+
         try:
+            if (
+                index > 0
+                and self._temporal_continuity_provider
+                is not None
+            ):
+                temporal_state = await (
+                    self._temporal_continuity_provider
+                    .describe_transition(
+                        request=state["request"],
+                        previous_shot=plan.shots[index - 1],
+                        current_shot=shot,
+                        current_shot_index=index,
+                    )
+                )
+
+                if temporal_state is not None:
+                    effective_prompt = (
+                        self._continuity_prompt_builder.build(
+                            base_prompt=base_prompt,
+                            state=temporal_state,
+                            has_previous_frame=(
+                                initial_reference
+                                is not None
+                            ),
+                        )
+                    )
+
             generation_kwargs = {
                 "shot": shot,
-                "prompt": prompt,
+                "prompt": effective_prompt,
                 "output_path": requested_output_path,
             }
 
-            # Preserve compatibility with older fake/test generators when
-            # continuity is disabled.
+            # Keep compatibility with generators that predate image
+            # continuity when frame extraction is disabled.
             if self.continuity_enabled:
-                generation_kwargs["initial_image"] = (
-                    initial_reference
-                )
+                generation_kwargs[
+                    "initial_image"
+                ] = initial_reference
 
             generated = await (
                 self._shot_generator.generate_shot(
@@ -356,6 +421,15 @@ class LongVideoWorkflow:
                         else None
                     ),
                     "last_frame_reference_path": None,
+                    "base_generation_prompt": base_prompt,
+                    "effective_generation_prompt": (
+                        effective_prompt
+                    ),
+                    "temporal_continuity": (
+                        temporal_state.to_dict()
+                        if temporal_state is not None
+                        else None
+                    ),
                 }
             else:
                 resolved_path = Path(
@@ -380,6 +454,15 @@ class LongVideoWorkflow:
                         else None
                     ),
                     "last_frame_reference_path": None,
+                    "base_generation_prompt": base_prompt,
+                    "effective_generation_prompt": (
+                        effective_prompt
+                    ),
+                    "temporal_continuity": (
+                        temporal_state.to_dict()
+                        if temporal_state is not None
+                        else None
+                    ),
                 }
 
             if not resolved_path.exists():
@@ -395,7 +478,10 @@ class LongVideoWorkflow:
                     f"{resolved_path}"
                 )
 
-            continuity_update: dict[str, object] = {}
+            continuity_update: dict[
+                str,
+                object,
+            ] = {}
 
             if self._frame_extractor is not None:
                 reference_dir = (
@@ -424,10 +510,14 @@ class LongVideoWorkflow:
 
                 continuity_update = {
                     "continuity_previous_last_frame": (
-                        serialized["previous_last_frame"]
+                        serialized[
+                            "previous_last_frame"
+                        ]
                     ),
                     "continuity_reference_history": (
-                        serialized["reference_history"]
+                        serialized[
+                            "reference_history"
+                        ]
                     ),
                 }
 

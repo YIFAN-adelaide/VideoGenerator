@@ -1,108 +1,69 @@
-# Shot Continuity v1
+# Temporal Continuity V2
 
-This patch adds the first automatic long-video continuity loop:
+This patch tests the next hypothesis:
 
 ```text
-Shot 1
-  ↓
-generate MP4
-  ↓
-FrameExtractor
-  ↓
-reference_assets/jobs/<job>/shot_001_last.png
-  ↓
-Shot 2 initial_image
-  ↓
-generate MP4
-  ↓
-FrameExtractor
-  ↓
-shot_002_last.png
-  ↓
-Shot 3 initial_image
+V1
+previous final frame
+    -> FastWan
+
+V2
+previous final frame
++ semantic TemporalContinuityState
++ deterministic ContinuityPromptBuilder
+    -> FastWan
 ```
 
-## Files
+## Important architecture decision
 
-Add:
+`ContinuityPromptBuilder` does not call another model.
+
+For this experiment, a `StaticTemporalContinuityProvider` supplies known-good
+transition instructions. Later the vLLM/Qwen Director can implement the same
+`TemporalContinuityProvider` protocol and generate these states automatically.
+
+That means the user will NOT manually enter these fields in the final system.
+
+## Add
 
 ```text
-app/services/shot_continuity.py
-tests/test_fastvideo_shot_generator_continuity.py
-tests/test_long_video_continuity.py
-scripts/smoke_long_video_continuity.py
+app/services/temporal_continuity.py
+app/services/continuity_prompt_builder.py
+app/services/temporal_continuity_provider.py
+tests/test_continuity_prompt_builder.py
+tests/test_temporal_continuity_provider.py
+scripts/smoke_temporal_continuity_v2.py
 ```
 
-Update:
+## Update
 
 ```text
-app/services/fastvideo_shot_generator.py
 app/graph/long_video_workflow.py
 ```
 
-This patch assumes the previous milestones are already integrated:
+No change to FastVideoShotGenerator is required if Shot Continuity V1 is
+already integrated.
 
-- `FrameExtractor`
-- `ImageProbe`
-- `VideoGenerationRequest.initial_image`
-- FastVideoProvider `input_reference`
-- shared `reference_assets:/inputs:ro` Docker mount
-- the FastVideo Wan I2V requested-canvas patch
-
-## Backward compatibility
-
-Continuity is enabled only when the workflow receives a `frame_extractor`.
-
-Existing code:
-
-```python
-LongVideoWorkflow(
-    director=...,
-    shot_generator=...,
-    composer=...,
-    output_dir=...,
-)
-```
-
-continues to run without continuity and does not pass `initial_image` to older
-fake/test shot generators.
-
-New continuity mode:
-
-```python
-LongVideoWorkflow(
-    director=...,
-    shot_generator=...,
-    composer=...,
-    output_dir=...,
-    frame_extractor=FrameExtractor(),
-    reference_asset_dir="reference_assets",
-)
-```
-
-## Local tests
-
-After copying the files into the repository:
+## Local
 
 ```bash
-pytest -q tests/test_fastvideo_shot_generator_continuity.py
-pytest -q tests/test_long_video_continuity.py
+pytest -q tests/test_continuity_prompt_builder.py
+pytest -q tests/test_temporal_continuity_provider.py
 pytest -q
 ```
 
-AWS-only Docker diagnostics may show as skipped locally. That is expected.
-
-## Commit/push
+## Commit
 
 ```bash
-git add app/services/shot_continuity.py
-git add app/services/fastvideo_shot_generator.py
+git add app/services/temporal_continuity.py
+git add app/services/continuity_prompt_builder.py
+git add app/services/temporal_continuity_provider.py
 git add app/graph/long_video_workflow.py
-git add tests/test_fastvideo_shot_generator_continuity.py
-git add tests/test_long_video_continuity.py
-git add scripts/smoke_long_video_continuity.py
+git add tests/test_continuity_prompt_builder.py
+git add tests/test_temporal_continuity_provider.py
+git add scripts/smoke_temporal_continuity_v2.py
 
-git commit -m "Add sequential shot continuity"
+git commit -m "Add semantic temporal continuity prompts"
 git push
 ```
 
@@ -117,52 +78,32 @@ set -a
 source .env
 set +a
 
-pytest -q tests/test_fastvideo_shot_generator_continuity.py
-pytest -q tests/test_long_video_continuity.py
-```
+pytest -q tests/test_continuity_prompt_builder.py
+pytest -q tests/test_temporal_continuity_provider.py
 
-Confirm the patched FastVideo server is still running:
-
-```bash
 curl --fail-with-body http://127.0.0.1:9200/health
 ```
 
-Then run the real three-shot test:
+Run:
 
 ```bash
-python -m scripts.smoke_long_video_continuity
+python -m scripts.smoke_temporal_continuity_v2
 ```
 
-Expected logical handoff:
+The script prints the exact effective FastWan prompt for each shot.
 
-```text
-shot_001 initial image: None
-shot_001 last frame: reference_assets/jobs/<job>/shot_001_last.png
+Download the resulting `final.mp4` and compare it with the previous V1
+continuity video. Focus on:
 
-shot_002 initial image: .../shot_001_last.png
-shot_002 last frame: .../shot_002_last.png
+- subject screen-position jump
+- direction reset
+- action/gait reset
+- camera reframing
+- identity/environment continuity
 
-shot_003 initial image: .../shot_002_last.png
-shot_003 last frame: .../shot_003_last.png
-```
+## Why the test provider is static
 
-Each generated clip should remain 121 frames at 24fps (~5.041667 seconds).
-
-## What this test proves
-
-It proves the technical continuity chain. It does NOT yet prove that the model
-produces perfect visual continuity.
-
-After the real test, inspect:
-
-1. the boundary between shot 1 and shot 2,
-2. the boundary between shot 2 and shot 3,
-3. whether the tiger identity/composition drifts,
-4. whether the first frame of each new shot visually follows its reference.
-
-Only after this is stable should we add:
-- character reference bank
-- environment/style references
-- visual QC
-- bounded retry
-- transition/timeline editing
+We intentionally do not integrate vLLM in the same experiment. If V2 improves
+motion continuity, we have isolated the benefit of the semantic state and
+prompt builder. Then the next patch is to make the real Director generate the
+same structured state.
