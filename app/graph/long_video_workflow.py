@@ -8,26 +8,20 @@ from langgraph.graph import END, START, StateGraph
 
 from app.director.base import BaseDirector
 from app.director.video_plan import DirectorRequest, ShotPlan, VideoPlan
+from app.services.frame_extractor import FrameExtractor
 from app.services.generated_shot import GeneratedShot
+from app.services.shot_continuity import ShotContinuityState
 from app.services.video_composer import VideoComposer
 
 
 class ShotGenerator(Protocol):
-    """
-    Adapter contract used by the long-video graph.
-
-    A shot generator may return the richer GeneratedShot result or a
-    legacy str/Path. The latter is retained so existing fake/test
-    generators and future adapters are not forced to implement probing
-    immediately.
-    """
-
     async def generate_shot(
         self,
         *,
         shot: ShotPlan,
         prompt: str,
         output_path: Path,
+        initial_image: Path | None = None,
     ) -> GeneratedShot | str | Path:
         ...
 
@@ -45,6 +39,9 @@ class CompletedShotInfo(TypedDict):
     width: int | None
     height: int | None
 
+    initial_image_path: str | None
+    last_frame_reference_path: str | None
+
 
 class LongVideoState(TypedDict):
     job_id: str
@@ -56,6 +53,9 @@ class LongVideoState(TypedDict):
     completed_shot_paths: list[str]
     completed_shots: list[CompletedShotInfo]
 
+    continuity_previous_last_frame: str | None
+    continuity_reference_history: list[str]
+
     status: str
     final_output_path: str | None
     error: str | None
@@ -63,36 +63,19 @@ class LongVideoState(TypedDict):
 
 class LongVideoWorkflow:
     """
-    LangGraph orchestration for long-form video generation.
+    Sequential long-video workflow with optional shot-to-shot continuity.
 
-    V1 flow:
+    Continuity is enabled when ``frame_extractor`` is provided:
 
-        plan_video
-            ↓
-        generate_current_shot
-            ↓
-        more shots?
-         ↙      ↘
-       yes      no
-        ↓        ↓
-      loop     compose_video
-                  ↓
-               completed
+        Shot N
+          -> generate
+          -> extract exact final frame
+          -> store under reference_assets/jobs/<job_id>/
+          -> pass that PNG as initial_image for Shot N+1
 
-    completed_shot_paths is preserved for compatibility with the
-    existing composer. completed_shots adds observed generation
-    metadata when the shot generator returns GeneratedShot.
-
-    This version intentionally does not include:
-        - quality evaluation
-        - retry-on-quality
-        - reference-frame extraction
-        - continuity-state updates
-        - parallel generation
-        - exact-duration trimming
-        - audio
-
-    Those are future graph nodes.
+    If ``frame_extractor`` is omitted, the workflow behaves like the previous
+    implementation and does not pass initial_image arguments to legacy fake
+    generators. This keeps existing tests/backends backward compatible.
     """
 
     def __init__(
@@ -103,6 +86,8 @@ class LongVideoWorkflow:
         composer: VideoComposer,
         output_dir: str | Path,
         video_prompt_language: str = "en",
+        frame_extractor: FrameExtractor | None = None,
+        reference_asset_dir: str | Path = "reference_assets",
     ) -> None:
         if video_prompt_language not in {"en", "zh"}:
             raise ValueError(
@@ -115,7 +100,18 @@ class LongVideoWorkflow:
         self._output_dir = Path(output_dir)
         self._video_prompt_language = video_prompt_language
 
+        self._frame_extractor = frame_extractor
+        self._reference_asset_dir = (
+            Path(reference_asset_dir)
+            .expanduser()
+            .resolve()
+        )
+
         self.graph = self._build_graph()
+
+    @property
+    def continuity_enabled(self) -> bool:
+        return self._frame_extractor is not None
 
     def _build_graph(self):
         builder = StateGraph(LongVideoState)
@@ -169,8 +165,35 @@ class LongVideoWorkflow:
         request: DirectorRequest,
         *,
         job_id: str | None = None,
+        initial_image: str | Path | None = None,
     ) -> LongVideoState:
         resolved_job_id = job_id or uuid4().hex
+
+        initial_reference: str | None = None
+
+        if initial_image is not None:
+            candidate = (
+                Path(initial_image)
+                .expanduser()
+                .resolve()
+            )
+
+            if not candidate.exists():
+                raise FileNotFoundError(
+                    f"Initial continuity image does not exist: {candidate}"
+                )
+
+            if not candidate.is_file():
+                raise ValueError(
+                    f"Initial continuity image is not a file: {candidate}"
+                )
+
+            if candidate.stat().st_size <= 0:
+                raise ValueError(
+                    f"Initial continuity image is empty: {candidate}"
+                )
+
+            initial_reference = str(candidate)
 
         initial_state: LongVideoState = {
             "job_id": resolved_job_id,
@@ -179,6 +202,12 @@ class LongVideoWorkflow:
             "current_shot_index": 0,
             "completed_shot_paths": [],
             "completed_shots": [],
+            "continuity_previous_last_frame": initial_reference,
+            "continuity_reference_history": (
+                [initial_reference]
+                if initial_reference is not None
+                else []
+            ),
             "status": "planning",
             "final_output_path": None,
             "error": None,
@@ -267,12 +296,38 @@ class LongVideoWorkflow:
             / f"{shot.shot_id}.mp4"
         )
 
+        continuity = ShotContinuityState.from_json_state(
+            previous_last_frame=state[
+                "continuity_previous_last_frame"
+            ],
+            reference_history=state[
+                "continuity_reference_history"
+            ],
+        )
+
+        initial_reference = (
+            continuity.previous_last_frame
+            if self.continuity_enabled
+            else None
+        )
+
         try:
+            generation_kwargs = {
+                "shot": shot,
+                "prompt": prompt,
+                "output_path": requested_output_path,
+            }
+
+            # Preserve compatibility with older fake/test generators when
+            # continuity is disabled.
+            if self.continuity_enabled:
+                generation_kwargs["initial_image"] = (
+                    initial_reference
+                )
+
             generated = await (
                 self._shot_generator.generate_shot(
-                    shot=shot,
-                    prompt=prompt,
-                    output_path=requested_output_path,
+                    **generation_kwargs
                 )
             )
 
@@ -295,6 +350,12 @@ class LongVideoWorkflow:
                     "frame_count": generated.frame_count,
                     "width": generated.width,
                     "height": generated.height,
+                    "initial_image_path": (
+                        str(initial_reference)
+                        if initial_reference is not None
+                        else None
+                    ),
+                    "last_frame_reference_path": None,
                 }
             else:
                 resolved_path = Path(
@@ -313,6 +374,12 @@ class LongVideoWorkflow:
                     "frame_count": None,
                     "width": None,
                     "height": None,
+                    "initial_image_path": (
+                        str(initial_reference)
+                        if initial_reference is not None
+                        else None
+                    ),
+                    "last_frame_reference_path": None,
                 }
 
             if not resolved_path.exists():
@@ -326,6 +393,48 @@ class LongVideoWorkflow:
                 raise RuntimeError(
                     "Shot generator produced an empty file: "
                     f"{resolved_path}"
+                )
+
+            continuity_update: dict[str, object] = {}
+
+            if self._frame_extractor is not None:
+                reference_dir = (
+                    self._reference_asset_dir
+                    / "jobs"
+                    / state["job_id"]
+                )
+
+                reference_path = (
+                    reference_dir
+                    / f"{shot.shot_id}_last.png"
+                )
+
+                extraction = await (
+                    self._frame_extractor.extract_last_frame(
+                        resolved_path,
+                        reference_path,
+                    )
+                )
+
+                continuity = continuity.advance(
+                    extraction.output_path
+                )
+
+                serialized = continuity.to_json_state()
+
+                continuity_update = {
+                    "continuity_previous_last_frame": (
+                        serialized["previous_last_frame"]
+                    ),
+                    "continuity_reference_history": (
+                        serialized["reference_history"]
+                    ),
+                }
+
+                completed_info[
+                    "last_frame_reference_path"
+                ] = str(
+                    extraction.output_path.resolve()
                 )
 
             completed_paths = list(
@@ -348,6 +457,7 @@ class LongVideoWorkflow:
                 "current_shot_index": index + 1,
                 "status": "generating",
                 "error": None,
+                **continuity_update,
             }
 
         except Exception as exc:

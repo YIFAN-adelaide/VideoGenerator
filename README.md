@@ -1,157 +1,168 @@
-# FastVideo Wan I2V requested-canvas patch v1
+# Shot Continuity v1
 
-This creates a reproducible custom FastVideo image for the current
-VideoGenerator project.
+This patch adds the first automatic long-video continuity loop:
 
-## Why this patch exists
-
-FastVideo 0.2.1 currently contains this Wan image-input validation rule:
-
-```python
-max_area = 480 * 832
-ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+```text
+Shot 1
+  ↓
+generate MP4
+  ↓
+FrameExtractor
+  ↓
+reference_assets/jobs/<job>/shot_001_last.png
+  ↓
+Shot 2 initial_image
+  ↓
+generate MP4
+  ↓
+FrameExtractor
+  ↓
+shot_002_last.png
+  ↓
+Shot 3 initial_image
 ```
-
-That means a VideoGenerator request for a 1280x704 image-conditioned shot can
-still be reduced by FastVideo to a roughly 480p pixel budget.
-
-This patch changes only the pixel budget:
-
-```python
-max_area = batch.height * batch.width
-```
-
-`best_output_size()` is intentionally retained. It is still responsible for
-mapping the source aspect ratio onto valid Wan/VAE spatial alignment.
-
-## Safety / reproducibility behavior
-
-The patch script deliberately fails the Docker build if:
-
-- FastVideo is not version 0.2.1
-- the expected upstream source file is missing
-- the exact hard-coded rule is no longer present exactly once
-- the expected `best_output_size()` call is missing
-- the patched Python source no longer compiles
-
-This prevents silently carrying the patch onto a changed upstream release.
 
 ## Files
 
+Add:
+
 ```text
-docker/fastvideo/Dockerfile
-docker/fastvideo/patch_wan_i2v_resolution.py
-tests/test_fastvideo_i2v_resolution_patch.py
+app/services/shot_continuity.py
+tests/test_fastvideo_shot_generator_continuity.py
+tests/test_long_video_continuity.py
+scripts/smoke_long_video_continuity.py
 ```
 
-## Build on AWS
+Update:
 
-Pull the repository first, then:
+```text
+app/services/fastvideo_shot_generator.py
+app/graph/long_video_workflow.py
+```
+
+This patch assumes the previous milestones are already integrated:
+
+- `FrameExtractor`
+- `ImageProbe`
+- `VideoGenerationRequest.initial_image`
+- FastVideoProvider `input_reference`
+- shared `reference_assets:/inputs:ro` Docker mount
+- the FastVideo Wan I2V requested-canvas patch
+
+## Backward compatibility
+
+Continuity is enabled only when the workflow receives a `frame_extractor`.
+
+Existing code:
+
+```python
+LongVideoWorkflow(
+    director=...,
+    shot_generator=...,
+    composer=...,
+    output_dir=...,
+)
+```
+
+continues to run without continuity and does not pass `initial_image` to older
+fake/test shot generators.
+
+New continuity mode:
+
+```python
+LongVideoWorkflow(
+    director=...,
+    shot_generator=...,
+    composer=...,
+    output_dir=...,
+    frame_extractor=FrameExtractor(),
+    reference_asset_dir="reference_assets",
+)
+```
+
+## Local tests
+
+After copying the files into the repository:
+
+```bash
+pytest -q tests/test_fastvideo_shot_generator_continuity.py
+pytest -q tests/test_long_video_continuity.py
+pytest -q
+```
+
+AWS-only Docker diagnostics may show as skipped locally. That is expected.
+
+## Commit/push
+
+```bash
+git add app/services/shot_continuity.py
+git add app/services/fastvideo_shot_generator.py
+git add app/graph/long_video_workflow.py
+git add tests/test_fastvideo_shot_generator_continuity.py
+git add tests/test_long_video_continuity.py
+git add scripts/smoke_long_video_continuity.py
+
+git commit -m "Add sequential shot continuity"
+git push
+```
+
+## AWS
 
 ```bash
 cd ~/VG/VideoGenerator
+git pull
+source .venv/bin/activate
 
-docker build \
-  -f docker/fastvideo/Dockerfile \
-  -t videogen-fastvideo:0.2.1-i2v-resolution \
-  .
+set -a
+source .env
+set +a
+
+pytest -q tests/test_fastvideo_shot_generator_continuity.py
+pytest -q tests/test_long_video_continuity.py
 ```
 
-The build log should include:
-
-```text
-FastVideo version: 0.2.1
-Wan I2V resolution policy patched successfully.
-Old: max_area = 480 * 832
-New: max_area = batch.height * batch.width
-```
-
-## Replace the current FastVideo container
-
-```bash
-docker stop fastvideo-wan
-docker rm fastvideo-wan
-```
-
-Start the custom image with the same current runtime settings:
-
-```bash
-docker run -d \
-  --name fastvideo-wan \
-  --gpus all \
-  --ipc=host \
-  -e FASTVIDEO_ATTENTION_BACKEND=FLASH_ATTN \
-  -p 127.0.0.1:9200:9200 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -v ~/fastvideo_outputs:/outputs \
-  -v ~/fastvideo_config:/configs:ro \
-  -v ~/VG/VideoGenerator/reference_assets:/inputs:ro \
-  videogen-fastvideo:0.2.1-i2v-resolution \
-  /opt/venv/bin/fastvideo serve \
-  --config /configs/fastwan5b_server.yaml
-```
-
-Wait for FastVideo:
-
-```bash
-docker logs -f fastvideo-wan
-```
-
-Use Ctrl+C to stop following logs, then verify health:
+Confirm the patched FastVideo server is still running:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:9200/health
 ```
 
-## Verify the running patch without GPU inference
+Then run the real three-shot test:
 
 ```bash
-pytest -q -s tests/test_fastvideo_i2v_resolution_patch.py
+python -m scripts.smoke_long_video_continuity
 ```
 
-Expected context includes:
-
-```python
-max_area = batch.height * batch.width
-```
-
-and must not include:
-
-```python
-max_area = 480 * 832
-```
-
-## Re-run the existing real I2V smoke test
-
-Use the existing extracted 1280x704 final frame:
-
-```bash
-python -m scripts.smoke_image_to_video \
-  --image outputs/long-smoke-50df359b/references/shot_001_last.png \
-  --prompt "The tiger continues walking naturally through the snowy forest." \
-  --resolution 720p \
-  --duration 5
-```
-
-For this test we want to see:
+Expected logical handoff:
 
 ```text
-source: 1280x704
-canvas: 1280x704
+shot_001 initial image: None
+shot_001 last frame: reference_assets/jobs/<job>/shot_001_last.png
 
-video size: 1280x704
-frames: 121
-fps: 24.0
-duration: 5.041667
+shot_002 initial image: .../shot_001_last.png
+shot_002 last frame: .../shot_002_last.png
+
+shot_003 initial image: .../shot_002_last.png
+shot_003 last frame: .../shot_003_last.png
 ```
 
-The first generation after rebuilding/restarting the FastVideo image may pay
-the compile/warm-up cost again.
+Each generated clip should remain 121 frames at 24fps (~5.041667 seconds).
 
-## If the Docker build fails on the version guard
+## What this test proves
 
-Do not remove the guard.
+It proves the technical continuity chain. It does NOT yet prove that the model
+produces perfect visual continuity.
 
-A failure means the upstream FastVideo image no longer matches the exact
-0.2.1 implementation this patch was reviewed against. Inspect the new
-`input_validation.py` before adapting the patch.
+After the real test, inspect:
+
+1. the boundary between shot 1 and shot 2,
+2. the boundary between shot 2 and shot 3,
+3. whether the tiger identity/composition drifts,
+4. whether the first frame of each new shot visually follows its reference.
+
+Only after this is stable should we add:
+- character reference bank
+- environment/style references
+- visual QC
+- bounded retry
+- transition/timeline editing

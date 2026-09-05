@@ -8,6 +8,7 @@ from app.director.video_plan import ShotPlan
 from app.providers.base import VideoProvider
 from app.schemas import VideoGenerationRequest
 from app.services.generated_shot import GeneratedShot
+from app.services.image_probe import ImageProbe
 from app.services.video_probe import VideoProbe
 
 
@@ -20,17 +21,17 @@ class FastVideoShotGenerator:
     Adapter between LongVideoWorkflow's ShotGenerator protocol and the
     existing VideoProvider contract.
 
-    The provider API remains unchanged:
+    Image-conditioned generation is optional:
 
-        await provider.generate(
-            request: VideoGenerationRequest,
-            job_id: str,
-        )
+        initial_image=None
+            -> text-to-video shot
 
-    This adapter translates one ShotPlan into one VideoGenerationRequest,
-    invokes the provider, materializes the returned MP4 at the path
-    requested by LongVideoWorkflow, and probes the final file so the
-    workflow receives its real duration/frame metadata.
+        initial_image=<previous final frame>
+            -> image-conditioned next shot
+
+    The reference image is probed here so the generated video canvas follows
+    the reference image dimensions. The image should already be a model-ready
+    reference stored under the shared reference_assets directory.
     """
 
     def __init__(
@@ -39,10 +40,12 @@ class FastVideoShotGenerator:
         *,
         preserve_provider_output: bool = True,
         video_probe: VideoProbe | None = None,
+        image_probe: ImageProbe | None = None,
     ) -> None:
         self._provider = provider
         self._preserve_provider_output = preserve_provider_output
         self._video_probe = video_probe or VideoProbe()
+        self._image_probe = image_probe or ImageProbe()
 
     async def generate_shot(
         self,
@@ -50,6 +53,7 @@ class FastVideoShotGenerator:
         shot: ShotPlan,
         prompt: str,
         output_path: Path,
+        initial_image: Path | None = None,
     ) -> GeneratedShot:
         cleaned_prompt = prompt.strip()
 
@@ -63,12 +67,60 @@ class FastVideoShotGenerator:
 
         seed = self._extract_seed(shot)
 
+        request_kwargs: dict[str, object] = {
+            "prompt": cleaned_prompt,
+            "duration_seconds": shot.duration_seconds,
+            "fps": shot.fps,
+            "resolution": shot.resolution,
+            "seed": seed,
+        }
+
+        if initial_image is not None:
+            reference = (
+                Path(initial_image)
+                .expanduser()
+                .resolve()
+            )
+
+            if not reference.exists():
+                raise FastVideoShotGeneratorError(
+                    f"Initial image does not exist for shot "
+                    f"{shot.shot_id}: {reference}"
+                )
+
+            if not reference.is_file():
+                raise FastVideoShotGeneratorError(
+                    f"Initial image is not a file for shot "
+                    f"{shot.shot_id}: {reference}"
+                )
+
+            if reference.stat().st_size <= 0:
+                raise FastVideoShotGeneratorError(
+                    f"Initial image is empty for shot "
+                    f"{shot.shot_id}: {reference}"
+                )
+
+            try:
+                image_info = await self._image_probe.probe(
+                    reference
+                )
+            except Exception as exc:
+                raise FastVideoShotGeneratorError(
+                    f"Could not inspect initial image for shot "
+                    f"{shot.shot_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
+            request_kwargs.update(
+                {
+                    "initial_image": str(reference),
+                    "width": image_info.width,
+                    "height": image_info.height,
+                }
+            )
+
         request = VideoGenerationRequest(
-            prompt=cleaned_prompt,
-            duration_seconds=shot.duration_seconds,
-            fps=shot.fps,
-            resolution=shot.resolution,
-            seed=seed,
+            **request_kwargs
         )
 
         provider_job_id = self._build_provider_job_id(
@@ -179,16 +231,6 @@ class FastVideoShotGenerator:
         shot: ShotPlan,
         output_path: Path,
     ) -> str:
-        """
-        Create a traceable provider job id from the long-video job directory
-        and shot id.
-
-        Expected workflow path:
-            <output_dir>/<long_job_id>/shots/<shot_id>.mp4
-
-        which becomes:
-            <long_job_id>_<shot_id>
-        """
         long_job_id = (
             output_path.parent.parent.name
             if output_path.parent.name == "shots"
