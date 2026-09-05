@@ -48,6 +48,7 @@ class CompletedShotInfo(TypedDict):
     last_frame_reference_path: str | None
 
     base_generation_prompt: str
+    continuation_base_prompt: str
     effective_generation_prompt: str
     temporal_continuity: dict[str, object] | None
 
@@ -74,17 +75,19 @@ class LongVideoWorkflow:
     """
     Sequential long-video workflow.
 
-    V1 continuity:
-        previous shot final frame -> next shot initial_image
+    V2.1 changes one important rule:
+    for seamless continuation shots, do not feed the Director's standalone
+    "Create shot N / camera: wide-medium-close" generation wrapper back into
+    FastWan if a cleaner semantic ShotPlan.action is available.
 
-    V2 continuity:
-        previous shot final frame
-        + semantic TemporalContinuityState
-        -> ContinuityPromptBuilder
-        -> next FastWan prompt
+    Shot 1:
+        normal Director generation prompt
 
-    The prompt builder is deterministic. A future vLLM Director can implement
-    TemporalContinuityProvider without changing the workflow.
+    Shot 2+ seamless continuation:
+        semantic action
+        + previous final frame
+        + TemporalContinuityState
+        + ContinuityPromptBuilder
     """
 
     def __init__(
@@ -136,20 +139,10 @@ class LongVideoWorkflow:
     def continuity_enabled(self) -> bool:
         return self._frame_extractor is not None
 
-    @property
-    def temporal_continuity_enabled(self) -> bool:
-        return (
-            self._temporal_continuity_provider
-            is not None
-        )
-
     def _build_graph(self):
         builder = StateGraph(LongVideoState)
 
-        builder.add_node(
-            "plan_video",
-            self._plan_video,
-        )
+        builder.add_node("plan_video", self._plan_video)
         builder.add_node(
             "generate_current_shot",
             self._generate_current_shot,
@@ -159,10 +152,7 @@ class LongVideoWorkflow:
             self._compose_video,
         )
 
-        builder.add_edge(
-            START,
-            "plan_video",
-        )
+        builder.add_edge(START, "plan_video")
 
         builder.add_conditional_edges(
             "plan_video",
@@ -183,10 +173,7 @@ class LongVideoWorkflow:
             },
         )
 
-        builder.add_edge(
-            "compose_video",
-            END,
-        )
+        builder.add_edge("compose_video", END)
 
         return builder.compile()
 
@@ -202,11 +189,7 @@ class LongVideoWorkflow:
         initial_reference: str | None = None
 
         if initial_image is not None:
-            candidate = (
-                Path(initial_image)
-                .expanduser()
-                .resolve()
-            )
+            candidate = Path(initial_image).expanduser().resolve()
 
             if not candidate.exists():
                 raise FileNotFoundError(
@@ -243,9 +226,7 @@ class LongVideoWorkflow:
             "error": None,
         }
 
-        return await self.graph.ainvoke(
-            initial_state
-        )
+        return await self.graph.ainvoke(initial_state)
 
     async def _plan_video(
         self,
@@ -303,29 +284,20 @@ class LongVideoWorkflow:
         index = state["current_shot_index"]
 
         if index >= len(plan.shots):
-            return {
-                "status": "composing",
-            }
+            return {"status": "composing"}
 
         shot = plan.shots[index]
-        base_prompt = self._select_generation_prompt(
-            shot
-        )
+        base_prompt = self._select_generation_prompt(shot)
 
         shot_dir = (
             self._output_dir
             / state["job_id"]
             / "shots"
         )
-
-        shot_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        shot_dir.mkdir(parents=True, exist_ok=True)
 
         requested_output_path = (
-            shot_dir
-            / f"{shot.shot_id}.mp4"
+            shot_dir / f"{shot.shot_id}.mp4"
         )
 
         continuity = ShotContinuityState.from_json_state(
@@ -343,10 +315,9 @@ class LongVideoWorkflow:
             else None
         )
 
-        temporal_state: (
-            TemporalContinuityState | None
-        ) = None
+        temporal_state: TemporalContinuityState | None = None
 
+        continuation_base_prompt = base_prompt
         effective_prompt = base_prompt
 
         try:
@@ -365,14 +336,33 @@ class LongVideoWorkflow:
                     )
                 )
 
-                if temporal_state is not None:
+                if (
+                    temporal_state is not None
+                    and temporal_state.mode != "hard_cut"
+                ):
+                    # Prefer the semantic action for seamless continuation.
+                    # This avoids contradictory standalone-shot wrappers such
+                    # as "Create shot 2 ... Camera: medium tracking shot".
+                    semantic_action = getattr(
+                        shot,
+                        "action",
+                        None,
+                    )
+
+                    if (
+                        isinstance(semantic_action, str)
+                        and semantic_action.strip()
+                    ):
+                        continuation_base_prompt = (
+                            semantic_action.strip()
+                        )
+
                     effective_prompt = (
                         self._continuity_prompt_builder.build(
-                            base_prompt=base_prompt,
+                            base_prompt=continuation_base_prompt,
                             state=temporal_state,
                             has_previous_frame=(
-                                initial_reference
-                                is not None
+                                initial_reference is not None
                             ),
                         )
                     )
@@ -383,12 +373,10 @@ class LongVideoWorkflow:
                 "output_path": requested_output_path,
             }
 
-            # Keep compatibility with generators that predate image
-            # continuity when frame extraction is disabled.
             if self.continuity_enabled:
-                generation_kwargs[
-                    "initial_image"
-                ] = initial_reference
+                generation_kwargs["initial_image"] = (
+                    initial_reference
+                )
 
             generated = await (
                 self._shot_generator.generate_shot(
@@ -422,6 +410,9 @@ class LongVideoWorkflow:
                     ),
                     "last_frame_reference_path": None,
                     "base_generation_prompt": base_prompt,
+                    "continuation_base_prompt": (
+                        continuation_base_prompt
+                    ),
                     "effective_generation_prompt": (
                         effective_prompt
                     ),
@@ -432,9 +423,7 @@ class LongVideoWorkflow:
                     ),
                 }
             else:
-                resolved_path = Path(
-                    generated
-                ).resolve()
+                resolved_path = Path(generated).resolve()
 
                 completed_info = {
                     "shot_id": shot.shot_id,
@@ -455,6 +444,9 @@ class LongVideoWorkflow:
                     ),
                     "last_frame_reference_path": None,
                     "base_generation_prompt": base_prompt,
+                    "continuation_base_prompt": (
+                        continuation_base_prompt
+                    ),
                     "effective_generation_prompt": (
                         effective_prompt
                     ),
@@ -467,8 +459,7 @@ class LongVideoWorkflow:
 
             if not resolved_path.exists():
                 raise FileNotFoundError(
-                    "Shot generator returned a path "
-                    "that does not exist: "
+                    "Shot generator returned a path that does not exist: "
                     f"{resolved_path}"
                 )
 
@@ -478,10 +469,7 @@ class LongVideoWorkflow:
                     f"{resolved_path}"
                 )
 
-            continuity_update: dict[
-                str,
-                object,
-            ] = {}
+            continuity_update: dict[str, object] = {}
 
             if self._frame_extractor is not None:
                 reference_dir = (
@@ -510,14 +498,10 @@ class LongVideoWorkflow:
 
                 continuity_update = {
                     "continuity_previous_last_frame": (
-                        serialized[
-                            "previous_last_frame"
-                        ]
+                        serialized["previous_last_frame"]
                     ),
                     "continuity_reference_history": (
-                        serialized[
-                            "reference_history"
-                        ]
+                        serialized["reference_history"]
                     ),
                 }
 
@@ -530,16 +514,12 @@ class LongVideoWorkflow:
             completed_paths = list(
                 state["completed_shot_paths"]
             )
-            completed_paths.append(
-                str(resolved_path)
-            )
+            completed_paths.append(str(resolved_path))
 
             completed_shots = list(
                 state["completed_shots"]
             )
-            completed_shots.append(
-                completed_info
-            )
+            completed_shots.append(completed_info)
 
             return {
                 "completed_shot_paths": completed_paths,
@@ -571,10 +551,7 @@ class LongVideoWorkflow:
         if plan is None:
             return "failed"
 
-        if (
-            state["current_shot_index"]
-            < len(plan.shots)
-        ):
+        if state["current_shot_index"] < len(plan.shots):
             return "generate"
 
         return "compose"
@@ -583,9 +560,7 @@ class LongVideoWorkflow:
         self,
         state: LongVideoState,
     ) -> dict:
-        completed = state[
-            "completed_shot_paths"
-        ]
+        completed = state["completed_shot_paths"]
 
         if not completed:
             return {
@@ -596,20 +571,10 @@ class LongVideoWorkflow:
                 ),
             }
 
-        final_dir = (
-            self._output_dir
-            / state["job_id"]
-        )
+        final_dir = self._output_dir / state["job_id"]
+        final_dir.mkdir(parents=True, exist_ok=True)
 
-        final_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        final_output = (
-            final_dir
-            / "final.mp4"
-        )
+        final_output = final_dir / "final.mp4"
 
         try:
             result = await self._composer.concatenate(
@@ -620,9 +585,7 @@ class LongVideoWorkflow:
             return {
                 "status": "completed",
                 "final_output_path": str(
-                    Path(
-                        result.output_path
-                    ).resolve()
+                    Path(result.output_path).resolve()
                 ),
                 "error": None,
             }

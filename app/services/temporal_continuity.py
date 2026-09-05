@@ -16,15 +16,15 @@ class TemporalContinuityState:
     """
     Semantic description of what must continue across one shot boundary.
 
-    This is intentionally more general than "motion continuity". It supports:
-    - locomotion: a tiger keeps walking
-    - transformations: a box keeps unfolding
-    - processes: ice keeps melting
-    - object interaction: a hand keeps writing
-    - camera continuity
+    V2.1 adds explicit screen/camera/world-response fields so the system can
+    avoid "reset the subject and replay the action" behavior.
 
-    Every field is optional. The Director should populate only what is
-    meaningful for the current transition.
+    This remains general-purpose:
+    - tiger walking
+    - box unfolding
+    - train moving
+    - flower blooming
+    - construction/destruction
     """
 
     mode: ContinuityMode = "continuous"
@@ -35,6 +35,11 @@ class TemporalContinuityState:
 
     spatial_change: str | None = None
     orientation_change: str | None = None
+
+    # New in V2.1
+    subject_screen_behavior: str | None = None
+    camera_response: str | None = None
+    environment_reveal: str | None = None
 
     camera_behavior: str | None = None
     camera_framing: str | None = None
@@ -50,6 +55,9 @@ class TemporalContinuityState:
             "next_development": self.next_development,
             "spatial_change": self.spatial_change,
             "orientation_change": self.orientation_change,
+            "subject_screen_behavior": self.subject_screen_behavior,
+            "camera_response": self.camera_response,
+            "environment_reveal": self.environment_reveal,
             "camera_behavior": self.camera_behavior,
             "camera_framing": self.camera_framing,
             "preserve": list(self.preserve),

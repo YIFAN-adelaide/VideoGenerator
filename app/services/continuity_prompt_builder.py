@@ -9,9 +9,18 @@ class ContinuityPromptBuilder:
     """
     Deterministic formatter.
 
-    It does NOT call an LLM and it does NOT inspect the previous video.
-    It converts structured temporal-continuity information produced by a
-    Director/planner into explicit instructions for the video model.
+    It does NOT inspect video and does NOT call an LLM.
+
+    V2.1 explicitly separates:
+    - process/action continuation
+    - subject screen-space behavior
+    - camera response
+    - newly revealed environment
+
+    This helps avoid the common failure mode:
+        subject reaches frame edge
+        -> next clip resets subject to opposite side
+        -> repeats same action
     """
 
     def build(
@@ -31,21 +40,18 @@ class ContinuityPromptBuilder:
 
         sections: list[str] = [cleaned]
 
-        intro: list[str] = []
-
         if has_previous_frame:
-            intro.append(
+            sections.append(
                 "Continue directly from the supplied previous-frame "
-                "reference. Treat this shot as the immediate next moment, "
-                "not as the beginning of a new scene."
+                "reference. This is the immediate next moment of the same "
+                "continuous event, not the beginning of a new shot. Do not "
+                "re-stage the subject or restart the action."
             )
         else:
-            intro.append(
-                "Treat this shot as a direct temporal continuation of the "
-                "previous planned action."
+            sections.append(
+                "Continue the same temporal event directly from the previous "
+                "planned moment. Do not restart the action."
             )
-
-        sections.append(" ".join(intro))
 
         temporal_lines: list[str] = []
 
@@ -66,7 +72,7 @@ class ContinuityPromptBuilder:
 
         if state.spatial_change:
             temporal_lines.append(
-                f"Spatial continuity: {state.spatial_change}."
+                f"World-space progression: {state.spatial_change}."
             )
 
         if state.orientation_change:
@@ -78,6 +84,30 @@ class ContinuityPromptBuilder:
             sections.append(
                 "Temporal continuity:\n- "
                 + "\n- ".join(temporal_lines)
+            )
+
+        screen_lines: list[str] = []
+
+        if state.subject_screen_behavior:
+            screen_lines.append(
+                f"Subject screen-space behavior: "
+                f"{state.subject_screen_behavior}."
+            )
+
+        if state.camera_response:
+            screen_lines.append(
+                f"Camera response: {state.camera_response}."
+            )
+
+        if state.environment_reveal:
+            screen_lines.append(
+                f"Environment reveal: {state.environment_reveal}."
+            )
+
+        if screen_lines:
+            sections.append(
+                "Spatial/camera continuation:\n- "
+                + "\n- ".join(screen_lines)
             )
 
         camera_lines: list[str] = []
@@ -117,9 +147,9 @@ class ContinuityPromptBuilder:
             )
 
         sections.append(
-            "Maintain natural temporal progression. Do not reset the "
-            "subject, object state, action, transformation, or camera unless "
-            "the instructions above explicitly require a change."
+            "Maintain natural temporal progression. Prefer moving or "
+            "reframing the camera to follow an ongoing process rather than "
+            "teleporting, resetting, or re-staging the subject."
         )
 
         return "\n\n".join(sections)
